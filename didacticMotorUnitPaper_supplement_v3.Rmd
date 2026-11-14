@@ -1,0 +1,1010 @@
+---
+title: "Online Supplement: Addressing Statistical Dependence in Motor Unit Studies with Mixed Effects Models"
+author: "Laura M. McPherson & Keith R. Lohse"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(glmmTMB)
+library(car)
+library(emmeans)
+library(knitr)
+
+```
+
+# Overview
+
+This supplemental appendix accompanies the didactic paper *"Addressing Statistical Dependence in Motor Unit Studies with Mixed Effects Models"*. The goal of this document is to walk step-by-step through the model progression outlined in Table 1, providing mathematical formulations, explicit matrix representations of random-effects covariance ($G$-side) and residual error covariance ($R$-side), and code chunks to reproduce all models.
+
+---
+
+# General Mathematical Framework
+
+In standard matrix notation, a linear mixed-effects model for observed outcome vector $y$ ($n \times 1$) is specified as:
+
+$$y = X\beta + Z\gamma + \epsilon$$
+
+Where:
+
+* $X$ is the $n \times p$ design matrix for the fixed effects, with parameter vector $\beta$ ($p \times 1$).
+* $Z$ is the $n \times q$ design matrix for the random effects, with random effects vector $\gamma$ ($q \times 1$).
+* $\epsilon$ is the $n \times 1$ vector of residual errors.
+
+The distributional assumptions for the random terms are:
+
+$$\gamma \sim \mathcal{N}(0, G), \quad \epsilon \sim \mathcal{N}(0, R), \quad \text{Cov}(\gamma, \epsilon) = 0$$
+
+The total marginal variance-covariance matrix of the observed data $y$ is given by:
+
+$$\text{Var}(y) = V = Z G Z^\top + R$$
+
+* **$G$-Side Matrix ($G$):** The covariance matrix of the random effects $\gamma$. It captures clustering and variation across design strata (e.g., people, muscles, motor units).
+
+
+* **$R$-Side Matrix ($R$):** The covariance matrix of the residual errors $\epsilon$. It captures residual variance and trial-to-trial correlation within observational units.
+
+
+
+---
+
+# Data Preparation
+
+We import the simulated dataset `SIM_DATA_v2.rds` (or run the simulation routine), which replicates the nested structure of high-density EMG decomposition data ($N = 14,280$ observations nested within 40 subjects, 116 muscles, and 4,067 unique motor units across repeated trials).
+
+```{r data-prep}
+# Load dataset from the same directory as this .Rmd file
+DATA_SIM <- readRDS("SIM_DATA_v2.rds")
+
+# Scramble Muscles
+DATA_SIM <- DATA_SIM %>%
+  mutate(Muscle = fct_recode(Muscle,
+                             A="C",
+                             C="A"), 
+         Muscle = fct_relevel(Muscle, "A", "B", "C"),
+         Trial = RelTrial)
+
+# Set orthogonal contrast coding for ANOVA tables
+options(contrasts = c("contr.poly", "contr.poly"))
+
+# Ensure factor structures
+DATA_SIM$Group    <- as.factor(DATA_SIM$Group)
+DATA_SIM$subjID   <- as.factor(DATA_SIM$subjID)
+DATA_SIM$Muscle   <- as.factor(DATA_SIM$Muscle)
+DATA_SIM$UniqueMU <- as.factor(DATA_SIM$UniqueMU)
+
+# Standardized predictors for pruned/maximal models
+DATA_SIM$Torque.z   <- scale(DATA_SIM$Torque.c)
+DATA_SIM$TorqueSq.z <- scale(DATA_SIM$TorqueSq.c)
+DATA_SIM$Trial.z <- scale(DATA_SIM$Trial)
+
+```
+
+---
+
+# Considering Different Models
+
+## Model 0: Hypothetical "Maximal" Model (Inestimable)
+
+### Didactic Explanation
+
+Following Barr et al. (2013), Model 0 specifies maximal random intercepts and slopes (linear torque, quadratic torque, trial) across all three strata. In practice, this model is inestimable because the number of estimated random-effects parameters exceeds the available data points, producing non-convergence and singular fit errors.
+
+However, this is a very useful model to sketch out in advance because it shows many of the different sources of variability that are possible and how we would *ideally* like to account for all of them. 
+
+**Caveat:** It is worth noting that reasonable people might disagree with what constitutes the "maximal" model. For instance, we have applied random intercepts to stratify our nested data and then fit random slopes within each of those strata. Although this is quite a complex model, it is not absolutely "maximal". Consider, for instance, if we had random slopes for all of our factors, including Muscle and Motor Unit, their interactions, and their covariances. Or, if we expanded the R-side of how we model residuals covariances (e.g., using either an autoregressive or totally unstructured residual covariance matrix) in addition to the random effects show here. Either of these would be an even more maximal structure (i.e., there are more parameters to be estimated), but Model 0 is a good candidate for maximal random effects structure, if we restrict ourselves to the idea of nested strata and independent residuals. For more on random intercepts versus slopes see `Expanding Endnote ii` at the bottom of this supplement.      
+
+
+### Mathematical Specification
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrices:**  
+Full $4 \times 4$ unstructured covariance blocks are specified at all three levels (Person, Muscle, Motor Unit):
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{u0} & \sigma_{u0,u1} & \sigma_{u0,u2} & \sigma_{u0,u3} \\  \sigma_{u0,u1} & \sigma^2_{u1} & \sigma_{u1,u2} & \sigma_{u1,u3} \\  \sigma_{u0,u2} & \sigma_{u1,u2} & \sigma^2_{u2} & \sigma_{u2,u3} \\  \sigma_{u0,u3} & \sigma_{u1,u3} & \sigma_{u2,u3} & \sigma^2_{u3} \end{bmatrix}, \quad G_{\text{musc}} = \begin{bmatrix} \sigma^2_{v0} & \sigma_{v0,v1} & \sigma_{v0,v2} & \sigma_{v0,v3} \\  \sigma_{v0,v1} & \sigma^2_{v1} & \sigma_{v1,v2} & \sigma_{v1,v3} \\  \sigma_{v0,v2} & \sigma_{v1,v2} & \sigma^2_{v2} & \sigma_{v2,v3} \\  \sigma_{v0,v3} & \sigma_{v1,v3} & \sigma_{v2,v3} & \sigma^2_{v3} \end{bmatrix}, \quad G_{\text{MU}} = \begin{bmatrix} \sigma^2_{w0} & \sigma_{w0,w1} & \sigma_{w0,w2} & \sigma_{w0,w3} \\  \sigma_{w0,w1} & \sigma^2_{w1} & \sigma_{w1,w2} & \sigma_{w1,w3} \\  \sigma_{w0,w2} & \sigma_{w1,w2} & \sigma^2_{w2} & \sigma_{w2,w3} \\  \sigma_{w0,w3} & \sigma_{w1,w3} & \sigma_{w2,w3} & \sigma^2_{w3} \end{bmatrix}$$
+
+
+#### $R$-Side Matrix
+
+$$R = \sigma^2 I_n$$
+
+```{r model-0, eval=FALSE}
+# Hypothetical Maximal Model - Fails to converge in practice
+mod_maximal <- lmer(
+  FR ~ Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c + Trial +
+    (1 + Torque.c + TorqueSq.c + Trial | subjID) +
+    (1 + Torque.c + TorqueSq.c + Trial | subjID:Muscle) +
+    (1 + Torque.c + TorqueSq.c + Trial | subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  control = cl_a,
+  REML = TRUE
+)
+
+```
+
+
+---
+
+## Model 1: Ordinary Least Squares (OLS) Regression
+
+### Didactic Explanation
+
+Model 1 ignores all nested structures in the data, treating every single motor unit discharge rate observation as completely independent. Because observations from the same person, muscle, or motor unit are highly correlated, assuming independence severely inflates the effective sample size ($df = 14,259$), leading to extreme Type I error rate inflation (pseudoreplication).
+
+### Mathematical Specification
+
+$$y_i = x_i^\top \beta + \epsilon_i, \quad i = 1, \dots, n$$
+
+#### $G$-Side Matrix
+
+No random effects are specified ($\gamma = 0$):
+
+$$G = [0]$$
+
+
+#### $R$-Side Matrix
+
+Assumes homoscedastic, independent errors across all $n$ observations:
+
+$$R = \sigma^2 I_n = \begin{bmatrix}  \sigma^2 & 0 & 0 & \dots & 0 \\  0 & \sigma^2 & 0 & \dots & 0 \\  0 & 0 & \sigma^2 & \dots & 0 \\  \vdots & \vdots & \vdots & \ddots & \vdots \\  0 & 0 & 0 & \dots & \sigma^2  \end{bmatrix}_{n \times n}$$
+
+```{r model-1}
+mod_ols <- lm(
+  FR ~ Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c+ Trial,
+  data = DATA_SIM
+)
+
+summary(mod_ols)
+car::Anova(mod_ols, type = "III")
+
+```
+
+---
+
+## Model 2: Random Intercept for Subject
+
+### Didactic Explanation
+
+Model 2 introduces a random intercept for Person (`subjID`). This accounts for baseline differences across people (the highest level of nesting). However, it ignores lower-level nesting across muscles and motor units, leaving test statistics for lower-level predictors vulnerable to pseudoreplication.
+
+### Mathematical Specification
+
+For observation $i$ in subject $j$:
+
+$$y_{ij} = x_{ij}^\top \beta + u_{0j} + \epsilon_{ij}, \quad u_{0j} \sim \mathcal{N}(0, \sigma^2_{\text{sub}})$$
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrix:**  
+For each person $j$, $G_{\text{sub}}$ is a $1 \times 1$ scalar variance term representing participant baseline variance:
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} \end{bmatrix}$$
+
+**Full Combined $G$-side Matrix:**  
+Expanding $G_{\text{sub}}$ across all $N_{\text{Person}} = 40$ participants yields the full block-diagonal $G$ matrix. Do do this, we will take the *Kronecker product* ($\otimes$), with an *identity matrix* ($I_{N_{}}$). Conceptually, you can think about this like we are turning our matrix into a rubber stamp ($G_{\text{sub}}$), and then we will repeatedly stamp that matrix into every non-zero spot on in the identity matrix:
+
+$$G = I_{N_{\text{Person}}} \otimes G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} & 0 & \dots & 0 \\  0 & \sigma^2_{\text{sub}} & \dots & 0 \\  \vdots & \vdots & \ddots & \vdots \\  0 & 0 & \dots & \sigma^2_{\text{sub}} \end{bmatrix}_{N_{\text{Person}} \times N_{\text{Person}}}$$
+
+
+#### $R$-Side Matrix
+
+$$R = \sigma^2 I_n$$
+
+```{r model-2}
+cl_a <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e9))
+
+mod_RI_sub <- lmer(
+  FR ~ Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c + Trial+
+    (1 | subjID),
+  data = DATA_SIM,
+  control = cl_a,
+  REML = TRUE
+)
+
+summary(mod_RI_sub)
+anova(mod_RI_sub)
+
+```
+
+---
+
+## Model 3: Random Intercepts for All Design Strata
+
+### Didactic Explanation
+
+Model 3 explicitly models all three nested design strata: Person (`subjID`), Muscle within Person (`subjID:Muscle`), and Motor Unit within Muscle within Person (`subjID:Muscle:UniqueMU`). This reflects the minimum necessary random-effects structure dictated by the physical study design. By capturing variance at all strata, denominator degrees of freedom for Person- and muscle-level fixed effects drop to realistic values ($df \approx 37$ and $df \approx 73$), eliminating pseudoreplication for higher-strata parameters.
+
+### Mathematical Specification
+
+For observation $m$ from motor unit $k$, muscle $j$, and subject $i$:
+
+$$y_{ijkm} = x_{ijkm}^\top \beta + u_{0i} + v_{0ij} + w_{0ijk} + \epsilon_{ijkm}$$
+
+where $u_{0i} \sim \mathcal{N}(0, \sigma^2_{\text{sub}})$, $v_{0ij} \sim \mathcal{N}(0, \sigma^2_{\text{musc}})$, and $w_{0ijk} \sim \mathcal{N}(0, \sigma^2_{\text{MU}})$.
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrices:**  
+Each design stratum contributes a $1 \times 1$ scalar variance component:
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} \end{bmatrix}, \quad G_{\text{musc}} = \begin{bmatrix} \sigma^2_{\text{musc}} \end{bmatrix}, \quad G_{\text{MU}} = \begin{bmatrix} \sigma^2_{\text{MU}} \end{bmatrix}$$
+
+The same sub-matrix applies to every person (or muscle, or motor unit), and random effects from different people, muscles, or motor units are assumed independent. The full G-side matrix can then be built similarly to Model 2, where we work it out in full, but we want to keep the focus on these sub-matrices and their relationship to key sources of statistical dependence in our example.
+
+
+#### $R$-Side Matrix
+
+$$R = \sigma^2 I_n$$
+
+```{r model-3}
+mod_RI_strata <- lmer(
+  FR ~ Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c + Trial+
+    (1 | subjID) +
+    (1 | subjID:Muscle) +
+    (1 | subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  control = cl_a,
+  REML = TRUE
+)
+
+summary(mod_RI_strata)
+anova(mod_RI_strata)
+
+```
+
+---
+
+## Model 4: Linear Random Slopes Model
+
+### Didactic Explanation
+
+Model 4 improves on Model 3 by adding random slopes for linear torque (`Torque.c`). Biologically, Person-level torque slopes would capture systemic differences in rate-coding gain between people, while muscle-level torque slopes capture localized motor pool similarlity that differs between muscles. Because motor units contain sparse trial counts (median $n = 3$), random slopes were omitted at the motor unit stratum $a priori$ to maintain model estimability. Other random slopes (`TorqueSq.c` or `Trial`) were omited from the Person- and Muscle-levels as part of troubleshooting model convergens issues. 
+
+### Mathematical Specification
+
+$$y_{ijkm} = x_{ijkm}^\top \beta + u_{0i} + u_{1i}\text{Torque}_{ijkm} + v_{0ij} + v_{1ij}\text{Torque}_{ijkm} + w_{0ijk} + \epsilon_{ijkm}$$
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrices:**  
+The Person stratum $G_{\text{sub}}$ is an unstructured $2 \times 2$ matrix, the muscle stratum $G_{\text{musc}}$ is an unstructured $2 \times 2$ matrix, and the motor unit stratum $G_{\text{MU}}$ is a $1 \times 1$ scalar variance:
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{u0} & \sigma_{u0,u1} \\  \sigma_{u0,u1} & \sigma^2_{u1}\end{bmatrix}, \quad G_{\text{musc}} = \begin{bmatrix} \sigma^2_{v0} & \sigma_{v0,v1} \\  \sigma_{v0,v1} & \sigma^2_{v1} \end{bmatrix}, \quad G_{\text{MU}} = \begin{bmatrix} \sigma^2_{w0} \end{bmatrix}$$
+
+The same sub-matrix applies to every person (or muscle, or motor unit), and random effects from different people, muscles, or motor units are assumed independent. The full G-side matrix can then be built similarly to Model 2, where we work it out in full, but we want to keep the focus on these sub-matrices and their relationship to key sources of statistical dependence in our example.
+
+
+#### $R$-Side Matrix
+
+$$R = \sigma^2 I_n$$
+
+```{r model-4}
+mod_lin <- lmer(
+  FR ~ Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c + Trial +
+    (1 + Torque.c | subjID) +
+    (1 + Torque.c | subjID:Muscle) +
+    (1 | subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  control = cl_a,
+  REML = TRUE
+)
+
+summary(mod_lin)
+anova(mod_lin)
+
+```
+
+
+---
+
+## Model 5: Pruned "Maximal" Model with Independent Random Effects
+
+### Didactic Explanation
+
+To resolve non-convergence while preserving protection against pseudoreplication for higher-order quadratic terms (`TorqueSq`), Model 5 applies two troubleshooting steps:
+
+1. Continuous predictors are standardized ($z$-scores) to improve optimizer stability.
+
+
+2. The `||` operator is used to force zero correlations among random parameters, diagonalizing the $G$-side covariance matrix.
+
+3. Convergence issues persisted with `Trial.z` modeled at the muscle level, so we tried to reallocate that term at the Motor Unit level. 
+
+4. This model converged but does return a singular fit warning (not a convergence error) for `Trial.z` at the Person-level (estimated variance is 0). This term could reasonably be dropped but in an effort to retain maximal random slope structure in a converging model, we left this term in. 
+
+
+
+### Mathematical Specification
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrices:**  
+Forcing zero correlation across random terms (`||`) diagonalizes the sub-matrices:
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{u0} & 0 & 0 & 0 \\  0 & \sigma^2_{u1} & 0 & 0 \\  0 & 0 & \sigma^2_{u2} & 0 \\  0 & 0 & 0 & \sigma^2_{u3} \end{bmatrix}, \quad G_{\text{musc}} = \begin{bmatrix} \sigma^2_{v0} & 0 & 0 \\  0 & \sigma^2_{v1} & 0 \\  0 & 0 & \sigma^2_{v2} \end{bmatrix}, \quad G_{\text{MU}} = \begin{bmatrix} \sigma^2_{w0} & 0 \\  0 & \sigma^2_{w3} \end{bmatrix}$$
+
+Again, the full G-side matrix can then be built similarly to Model 2, where we work it out in full, but we want to keep the focus on these sub-matrices and their relationship to key sources of statistical dependence in our example.
+
+
+#### $R$-Side Matrix
+
+$$R = \sigma^2 I_n$$
+
+```{r model-5}
+mod_prune <- lmer(
+  FR ~ Group * Muscle * Torque.z +
+    Group * Muscle * TorqueSq.z +
+    Age + Male_c + Trial.z +
+    (1 + Torque.z + TorqueSq.z + Trial.z|| subjID) +
+    (1 + Torque.z + TorqueSq.z || subjID:Muscle) +
+    (1 + Trial.z || subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  control = cl_a,
+  REML = TRUE
+)
+
+summary(mod_prune)
+anova(mod_prune)
+
+```
+
+---
+
+## Model 6: Autoregressive Dependence, AR(1), with Linear and Quadratic Torque Slopes
+
+### Didactic Explanation
+
+Model 6 addresses short-range stochastic dependence across sequential trials within individual motor units.
+
+On the $G$-side, random intercepts capture baseline variation across participants, muscles, and motor units. Participant-level linear torque slopes (`Torque.c`) capture individual differences in overall rate-coding gain, while muscle-level linear and quadratic torque slopes (`Torque.c + TorqueSq.c`) capture localized linear and curvilinear rate-coding dynamics across distinct muscle groups.
+
+Trial-to-trial dependence is modeled with an autoregressive order 1 process ($\text{AR}(1)$) within each motor unit. **Implementation note:** `glmmTMB` does not modify the residual matrix $R$ directly. Instead, `ar1(0 + Trial_f | subjID:Muscle:UniqueMU)` adds a set of *structured random effects*, one per trial for every motor unit, whose covariance follows an AR(1) pattern. These sit on the $G$-side, and an ordinary independent residual $\epsilon$ remains on the $R$-side. Because only the total (marginal) covariance of the data matters for inference, this is equivalent to an $R$-side structure of "AR(1) plus independent measurement error" (a "nugget"; in SAS, `REPEATED / TYPE=AR(1) LOCAL`). We show both views below.
+
+### Mathematical Specification
+
+For observation $m$ on trial $t_{ijkm}$ from motor unit $k$, muscle $j$, and subject $i$:
+
+$$y_{ijkm} = x_{ijkm}^\top \beta + u_{0i} + u_{1i}\text{Torque}_{ijkm} + v_{0ij} + v_{1ij}\text{Torque}_{ijkm} + v_{2ij}\text{TorqueSq}_{ijkm} + w_{0ijk} + a_{ijk}(t_{ijkm}) + \epsilon_{ijkm}$$
+
+where $u \sim \mathcal{N}(0, G_{\text{sub}})$, $v \sim \mathcal{N}(0, G_{\text{musc}})$, $w_{0ijk} \sim \mathcal{N}(0, \sigma^2_{w0})$, the AR(1) effects $a_{ijk} = \big(a_{ijk}(1), \dots, a_{ijk}(L)\big)^\top \sim \mathcal{N}(0, \Sigma_{\text{AR}})$ across the $L$ trial levels, and $\epsilon_{ijkm} \sim \mathcal{N}(0, \sigma^2_\epsilon)$ independently.
+
+#### $G$-Side Matrix
+
+**Stratum Sub-matrices:**  
+The Person stratum $G_{\text{sub}}$ is an unstructured $2 \times 2$ matrix (intercept, linear torque), the Muscle stratum $G_{\text{musc}}$ is an unstructured $3 \times 3$ matrix (intercept, linear torque, quadratic torque), the Motor Unit stratum $G_{\text{MU}}$ is a $1 \times 1$ intercept variance, and the AR(1) block $\Sigma_{\text{AR}}$ is an $L \times L$ matrix governed by just two parameters ($\sigma^2_{\text{ar}}$, $\rho$):
+
+$$G_{\text{sub}} = \begin{bmatrix} \sigma^2_{u0} & \sigma_{u0,u1} \\ \sigma_{u0,u1} & \sigma^2_{u1} \end{bmatrix}, \quad G_{\text{musc}} = \begin{bmatrix} \sigma^2_{v0} & \sigma_{v0,v1} & \sigma_{v0,v2} \\ \sigma_{v0,v1} & \sigma^2_{v1} & \sigma_{v1,v2} \\ \sigma_{v0,v2} & \sigma_{v1,v2} & \sigma^2_{v2} \end{bmatrix}, \quad G_{\text{MU}} = \begin{bmatrix} \sigma^2_{w0} \end{bmatrix}$$
+
+$$\Sigma_{\text{AR}} = \sigma^2_{\text{ar}} \begin{bmatrix} 1 & \rho & \rho^2 & \dots & \rho^{L-1} \\ \rho & 1 & \rho & \dots & \rho^{L-2} \\ \rho^2 & \rho & 1 & \dots & \rho^{L-3} \\ \vdots & \vdots & \vdots & \ddots & \vdots \\ \rho^{L-1} & \rho^{L-2} & \rho^{L-3} & \dots & 1 \end{bmatrix}_{L \times L}$$
+
+#### $R$-Side Matrix
+
+The residuals remain independent and homoscedastic:
+
+$$R = \sigma^2_\epsilon I_n$$
+
+#### How `glmmTMB`'s AR(1) relates to the "R-side" AR(1) in other software
+
+Model 6 assumes that observations from the same motor unit are dependent due to three factors:
+(1) a persistent offset for that unit (the motor-unit random intercept),
+(2) carryover between trials that fades with distance (an AR(1) process), and
+(3) independent measurement noise (the residual).
+
+Software differs in *where it files* Factor 2, specifically. In SAS PROC MIXED, an AR(1) structure is
+specified on the residual side with `REPEATED / TYPE=AR(1) LOCAL`, where the `LOCAL`
+option adds the independent measurement noise (Factor 3). In `glmmTMB`, the term
+`ar1(0 + Trial_f | subjID:Muscle:UniqueMU)` places the same AR(1) process on the
+random-effects side, and Factor 3 remains the ordinary residual. Because statistical
+inference depends only on the *total* covariance of the observations, these two
+specifications effectively describe the same model (see the `glmmTMB`
+[covariance-structures vignette](https://cran.r-project.org/web/packages/glmmTMB/vignettes/covstruct.html)
+and the SAS PROC MIXED
+[REPEATED statement documentation](https://support.sas.com/documentation/cdl/en/statug/67523/HTML/default/statug_mixed_syntax14.htm)).
+
+
+A pure $R$-side AR(1) with no measurement error can be approximated in `glmmTMB` by
+setting `dispformula = ~0`, which fixes $\sigma^2_\epsilon$ near zero. For these data that
+model is misspecified, because the simulation included independent noise, and thus that model does not
+estimate stably. Additionally, if we set `dispformula = ~0`, then we cannot apply Satterthwaite approximation to the degrees of freedom, which is a key comparison for our purposes in this paper.
+
+```{r model-6, error=TRUE}
+# Order data chronologically for AR(1) estimation
+DATA_SIM <- DATA_SIM %>%
+  arrange(subjID, Muscle, UniqueMU, Trial) %>%
+  mutate(Trial_f = factor(Trial))
+
+mod_ar1 <- glmmTMB(
+  FR ~ 1 + Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + Age + Male_c + Trial +
+    (1 + Torque.c | subjID) +
+    (1 + Torque.c + TorqueSq.c | subjID:Muscle) +
+    (1 | subjID:Muscle:UniqueMU) +
+    ar1(0 + Trial_f | subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  REML = TRUE
+  )
+
+summary(mod_ar1)
+
+# Note that glmmTMB uses asymptotic chi-square tests by default, so the base 
+# R anova() function will not work
+# anova(mod_ar1) - returns an error
+
+# Instead we can use the Anova() function from the car package
+car::Anova(mod_ar1, type = "III")
+
+# By default again, we get chi-squared tests, but we can ask specifically
+# for F-tests with Satterthwaite's approximation to the denominator df:
+car::Anova(mod_ar1, type = "III", test.statistic = "F", ddf = "satterthwaite")
+   
+   
+```
+
+---
+
+# Model Comparison and Evaluation
+
+We compare overall model fit across candidate specifications using Akaike’s Information Criterion (AIC) and the Bayesian Information Criterion (BIC).
+
+```{r model-comparison, warning=TRUE}
+# Refit all models with ML to compare across models... especially M5 
+# where predictors were scaled. Predictor scaling affects REML, 
+# whereas outcome scaling affect would affect both ML and REML.
+# ML also failed on Model 6 if we refit from scratch. Instead will 
+# "jump start" the ML fit using the REML estimated parameters.
+# this is equivalent to what refitML does for lme4 objects already:
+p <- mod_ar1$fit$par   # REML estimates of the variance parameters
+                       # (dispersion is named "betadisp" in glmmTMB >= 1.1.x)
+
+m6_ml <- update(mod_ar1, REML = FALSE,
+                start = list(beta     = unname(fixef(mod_ar1)$cond),
+                             theta    = unname(p[names(p) == "theta"]),
+                             betadisp = unname(p[names(p) == "betadisp"])),
+                control = glmmTMBControl(optCtrl = list(iter.max = 1e4, eval.max = 1e4)))
+
+ml_fits <- list(
+  "1. OLS Regression"                  = mod_ols,
+  "2. RI - Subject Only"               = lme4::refitML(mod_RI_sub),
+  "3. RI - All Strata (Sub/Musc/MU)"   = lme4::refitML(mod_RI_strata),
+  "4. Linear Random Slopes"            = lme4::refitML(mod_lin),
+  "5. Pruned Maximal (||)"            = lme4::refitML(mod_prune),
+  "6. Random Slopes + AR(1) Residuals" = m6_ml
+)
+
+# Convergence checks (printed so they are visible in the knitted file)
+sapply(ml_fits[2:5], isSingular)                         # generally want all FALSE, 
+                                                         # but may accept singular warning if model converges
+c(convergence = m6_ml$fit$convergence,                   # want 0
+  pdHess      = m6_ml$sdr$pdHess)                        # want TRUE
+
+model_fits <- data.frame(
+  Model = names(ml_fits),
+  AIC   = sapply(ml_fits, AIC),
+  BIC   = sapply(ml_fits, BIC),
+  row.names = NULL
+)
+
+knitr::kable(
+  model_fits,
+  digits  = 1,
+  caption = "Information criteria (ML refits) across candidate models"
+)
+
+```
+
+
+
+
+
+
+# Expanding Endnote ii: Nested Intercepts vs. Categorical Random Slopes
+
+A common decision in multi-muscle study designs is whether to model muscle as a nested random intercept (e.g., `(1|subjID) + (1|subjID:Muscle)`) or as a categorical random slope across participants (e.g., `(1+Muscle|subjID)` or `(0+Muscle|subjID)`). Mathematically, a nested random intercept is a highly constrained, parsimonious special case of a full categorical random slope. 
+
+To illustrate treating muscle as an intercept versus a slope introduces different trade-offs, consider a study with $N_{\text{Person}}$ participants where each participant is measured across $k = 3$ muscles (Muscles A, B, and C). We can compare the parameter complexity across three modeling options.
+
+---
+
+## 1. Nested Random Intercepts: `(1|subjID) + (1|subjID:Muscle)`
+
+### Mathematical Formulation
+This model assumes a single baseline variance across participants and a single, equal within-participant variance across all three muscles, with zero covariance between within-person muscle deviates:
+
+$$y_{ij} = x_{ij}^\top \beta + u_{0i} + v_{0ij} + \epsilon_{ij}$$
+
+where $u_{0i} \sim \mathcal{N}(0, \sigma^2_{\text{sub}})$ and $v_{0ij} \sim \mathcal{N}(0, \sigma^2_{\text{musc}})$.
+
+### $G$-Side Component Sub-matrices
+* **Person Component ($1 \times 1$):** $G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} \end{bmatrix}$ (1 parameter)
+* **Muscle Component ($3 \times 3$):** $G_{\text{musc}} = \begin{bmatrix} 
+\sigma^2_{\text{musc}} & 0 & 0 \\ 
+0 & \sigma^2_{\text{musc}} & 0 \\ 
+0 & 0 & \sigma^2_{\text{musc}} 
+\end{bmatrix} = \sigma^2_{\text{musc}} I_3$
+(1 parameter)
+
+* **Total $G$-side Covariance Parameters Estimated:** $1 + 1 = 2$ parameters.
+* **Assumptions:** Equal variance across all muscles ($\sigma^2_{\text{musc}}$) and zero covariance between muscle adjustments.
+
+---
+
+## 2. Orthogonal Categorical Random Slopes: `(1|subjID) + (0 + Muscle || subjID)`
+
+### Mathematical Formulation
+This model relaxes the equal-variance assumption by allowing each muscle to have its own unique within-participant variance, but forces all muscle covariances to be zero via the `||` operator:
+
+$$y_{ij} = x_{ij}^\top \beta + u_{0i} + v_{\text{A},i}\text{Musc}_{\text{A}} + v_{\text{B},i}\text{Musc}_{\text{B}} + v_{\text{C},i}\text{Musc}_{\text{C}} + \epsilon_{ij}$$
+
+### $G$-Side Component Sub-matrices
+* **Person Component ($1 \times 1$):** $G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} \end{bmatrix}$ (1 parameter)
+* **Muscle Component ($3 \times 3$):** $G_{\text{musc, diag}} = \begin{bmatrix} 
+\sigma^2_{\text{MuscA}} & 0 & 0 \\ 
+0 & \sigma^2_{\text{MuscB}} & 0 \\ 
+0 & 0 & \sigma^2_{\text{MuscC}} 
+\end{bmatrix}$ (3 parameters)
+
+* **Total $G$-side Covariance Parameters Estimated:** $1 + 3 = 4$ parameters.
+* **Assumptions:** Heterogeneous muscle variances ($\sigma^2_{\text{MuscA}} \neq \sigma^2_{\text{MuscB}} \neq \sigma^2_{\text{MuscC}}$), but zero muscle covariances.
+
+---
+
+## 3. Full Unstructured Categorical Random Slopes: `(1|subjID) + (0 + Muscle | subjID)`
+
+### Mathematical Formulation
+This model fits a fully unstructured $3 \times 3$ covariance matrix across muscles for each participant (in cell-means parameterization), allowing both unique muscle variances and unique pairwise muscle covariances:
+
+$$y_{ij} = x_{ij}^\top \beta + u_{0i} + v_{\text{A},i}\text{Musc}_{\text{A}} + v_{\text{B},i}\text{Musc}_{\text{B}} + v_{\text{C},i}\text{Musc}_{\text{C}} + \epsilon_{ij}$$
+
+### $G$-Side Component Sub-matrix
+* **Person Component ($1 \times 1$):** $G_{\text{sub}} = \begin{bmatrix} \sigma^2_{\text{sub}} \end{bmatrix}$ (1 parameter)
+
+* **Muscle Component ($3 \times 3$):**  
+
+$$G_{\text{musc, full}} = \begin{bmatrix} \sigma^2_{\text{MuscA}} & \sigma_{\text{AB}} & \sigma_{\text{AC}} \\  \sigma_{\text{AB}} & \sigma^2_{\text{MuscB}} & \sigma_{\text{BC}} \\  \sigma_{\text{AC}} & \sigma_{\text{BC}} & \sigma^2_{\text{MuscC}} \end{bmatrix}$$
+
+* **Total $G$-side Covariance Parameters Estimated:** $1+\frac{k(k+1)}{2} = 1+\frac{3(4)}{2} = 7$ parameters.
+
+* **Assumptions:** Unconstrained variances and covariances across all muscles.
+
+---
+
+## Model Comparison & Complexity Summary
+
+| Model Formulation | R `lme4` Formula | Muscle Variances | Muscle Covariances | Total $G$-side Parameters ($k=3$) |
+| :--- | :--- | :--- | :--- | :---: |
+| **Nested Intercepts** | `(1|subjID) + (1|subjID:Muscle)` | Equal ($\sigma^2_{\text{musc}}$) | Equal / Zero (0) | **2** |
+| **Orthogonal Slopes** | `(1|subjID) + (0 + Muscle || subjID)` | Unique ($\sigma^2_{\text{A}}, \sigma^2_{\text{B}}, \sigma^2_{\text{C}}$) | Forced Zero (0) | **4** |
+| **Full Unstructured Slopes** | `(1|subjID) + (0 + Muscle | subjID)` | Unique ($\sigma^2_{\text{A}}, \sigma^2_{\text{B}}, \sigma^2_{\text{C}}$) | Unconstrained ($\sigma_{\text{AB}}, \sigma_{\text{AC}}, \sigma_{\text{BC}}$) | **7** |
+
+As the number of muscle levels ($k$) grows, the parameter cost of full unstructured random slopes increases greatly ($\frac{k(k+1)}{2}$), whereas nested random intercepts remain parsimonious by requiring only 1 additional parameter regardless of $k$. Nested intercepts are therefore a pragmatic choice when data are sparse or when model convergence cannot support full slope covariance structures.
+
+**Note that in lme4, || removes correlations for factor terms only if options(lme4.doublevert.default = "diag_special") is set; in glmmTMB, the equivalent is diag(0 + Muscle | Person). In all of our examples in the paper, random slopes were for continuous variables like torque or trial. If authors want random slopes for categorical factors like Muscle, these additional steps must be taken to ensure orthogonality.**
+
+
+---
+
+# Code for Generating Figure 2, Extracting Marginal Residuals, Checking Dependence
+
+``` {r Figure2-diagnostics}
+library(patchwork)
+# Set Colorblind friendly pallette 
+cbPalette <- c("#999999", "#56B4E9","#E69F00", "#009E73", 
+               "#F0E442", "#0072B2", "#D55E00", "#CC79A7",
+               "#999933", "#882255", "#661100", "#6699CC")
+
+
+# Plot 1A: FR ~ Torque relationship in Controls ----
+# ------------------------------------------------------------------------------
+# Shared Theme for Subplots
+# ------------------------------------------------------------------------------
+theme_paper <- theme_bw() +
+  theme(
+    axis.text.y      = element_text(size = 11),
+    axis.text.x      = element_text(size = 11),
+    axis.title       = element_text(size = 11, face = "bold"),
+    plot.title       = element_text(size = 11, face = "bold", hjust = 0.5),
+    strip.text       = element_text(size = 11, face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.text      = element_text(size = 11),
+    legend.title     = element_text(size = 11, face = "bold")
+  )
+
+# ------------------------------------------------------------------------------
+# 1A: Controls (FR ~ Torque)
+# ------------------------------------------------------------------------------
+summary(DATA_SIM$Muscle)
+
+Fig1A <- ggplot(data = DATA_SIM %>% filter(Group == "Control"), 
+                aes(x = Torque.c, y = FR)) +
+  geom_point(aes(group = subjID), shape = 1, col = "grey50", alpha = 0.4) +
+  # Subject trends mapped inside aes() for legend generation
+  stat_smooth(aes(group = subjID, color = "Control Subject", linetype = "Control Subject"),
+              alpha = 0.8, lwd = 0.65, method = "lm", formula = y ~ x + I(x^2), se = FALSE) +
+  # Muscle average trend mapped inside aes()
+  stat_smooth(aes(group = Muscle, color = "Muscle Mean", linetype = "Muscle Mean"),
+              lwd = 1, method = "lm", formula = y ~ x + I(x^2), se = FALSE) +
+  facet_wrap(~ Muscle) +
+  labs(x = "Torque (centered, Nm)", y = "Firing Rate (Hz)", title = "Neurotypical Controls") +
+  scale_color_manual(name = "Model Fits", values = c("Control Subject" = cbPalette[2], "Muscle Mean" = "black")) +
+  scale_linetype_manual(name = "Model Fits", values = c("Control Subject" = "solid", "Muscle Mean" = "solid")) +
+  theme_paper
+
+# ------------------------------------------------------------------------------
+# 1B: Cases (FR ~ Torque)
+# ------------------------------------------------------------------------------
+Fig1B <- ggplot(data = DATA_SIM %>% filter(Group == "Case"), 
+                aes(x = Torque.c, y = FR)) +
+  geom_point(aes(group = subjID), shape = 4, col = "grey50", alpha = 0.4) +
+  # Subject trends mapped inside aes()
+  stat_smooth(aes(group = subjID, color = "Case Subject", linetype = "Case Subject"),
+              alpha = 0.8, lwd = 0.65, method = "lm", formula = y ~ x + I(x^2), se = FALSE) +
+  # Muscle average trend mapped inside aes()
+  stat_smooth(aes(group = Muscle, color = "Muscle Mean", linetype = "Muscle Mean"),
+              lwd = 1, method = "lm", formula = y ~ x + I(x^2), se = FALSE) +
+  facet_wrap(~ Muscle) +
+  labs(x = "Torque (centered, Nm)", y = "Firing Rate (Hz)", title = "Neurological Cases") +
+  scale_color_manual(name = "Model Fits", values = c("Case Subject" = cbPalette[3], "Muscle Mean" = "black")) +
+  scale_linetype_manual(name = "Model Fits", values = c("Case Subject" = "solid", "Muscle Mean" = "solid")) +
+  theme_paper
+
+
+# ------------------------------------------------------------------------------
+# 1C: Residual Persistence Trajectories (Example Subject)
+# ------------------------------------------------------------------------------
+# AR Null model to get residuals:
+mod_arNULL <- glmmTMB(
+  FR ~ 1 + Group * Muscle * Torque.c + 
+      Group * Muscle * TorqueSq.c + 
+      Age + Male_c + Trial +
+     # G-side: Subject and Muscle level random intercepts + Torque slopes
+      (1 + Torque.c | subjID) +
+      (1 + Torque.c | subjID:Muscle),
+  
+  # We will keep the R-side NULL - i.e., no autoregressive association
+  # R-side: Autoregressive trial correlation within Motor Units
+  #ar1(Trial_f + 0 | subjID:Muscle:UniqueMU),
+  data = DATA_SIM,
+  REML = TRUE
+)
+
+
+# Saving scaled residuals to the dataset
+DATA_SIM$residual <- resid(mod_arNULL)
+
+
+# Filter MUs with >= 4 trials
+mus_long <- DATA_SIM %>%
+  group_by(MU_GlobalID) %>%
+  filter(n() >= 4) %>%
+  ungroup()
+
+
+Fig1C_Trajectory <- ggplot(mus_long %>% filter(subjID == "S01"), 
+                           aes(x = Trial, y = residual, group = MU_GlobalID)) +
+  geom_hline(yintercept = 0, lty = 2, color = "black", alpha = 0.5) +
+  geom_line(color = cbPalette[2], alpha = 0.6, linewidth = 0.7) +
+  geom_point(color = cbPalette[2], size = 1.8, alpha = 0.8, shape=1) +
+  labs(x = "Relative Trial", y = "Model Residual - no AR(r)", title = "Example Subject Residuals") +
+  theme_paper
+
+
+# ------------------------------------------------------------------------------
+# 1D & 1E: Residual correlation by lag (1, 2, 3 trials apart)
+# ------------------------------------------------------------------------------
+lag_cor <- DATA_SIM %>%
+  arrange(MU_GlobalID, Trial) %>%
+  group_by(MU_GlobalID) %>%
+  mutate(lag_1 = lag(residual, 1),
+         lag_2 = lag(residual, 2),
+         lag_3 = lag(residual, 3)) %>%
+  ungroup() %>%
+  pivot_longer(lag_1:lag_3, names_to = "lag", values_to = "res_lag") %>%
+  filter(!is.na(res_lag)) %>%                     # keep only pairs that exist
+  mutate(lag = as.integer(sub("lag_", "", lag))) %>%
+  group_by(Group, lag) %>%
+  summarise(n  = n(),
+            r  = cor(residual, res_lag),
+            lo = tanh(atanh(r) - 1.96 / sqrt(n - 3)),   # approximate 95% CI
+            hi = tanh(atanh(r) + 1.96 / sqrt(n - 3)),
+            .groups = "drop")
+
+lag_cor   # check: n pairs and r at each lag, by group
+
+# Shared y-axis so the two panels are directly comparable
+y_lims <- c(min(lag_cor$lo) - 0.05, max(lag_cor$hi) + 0.05)
+
+plot_lag <- function(grp, col, shp, ttl) {
+  d <- lag_cor %>% filter(Group == grp)
+  ggplot(d, aes(x = lag, y = r)) +
+    # Reference: what lags 2-3 would look like if dependence were only
+    # persistent clustering within motor units (no decay)
+    geom_hline(yintercept = d$r[d$lag == 1], lty = 2, color = "black", alpha = 0.5) +
+    geom_line(color = col, linewidth = 0.8) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), color = col, shape = shp,
+                    size = 0.6, linewidth = 0.8) +
+    scale_x_continuous(breaks = 1:3) +
+    coord_cartesian(ylim = y_lims) +
+    labs(x = "Trials Apart (Lag)",
+         y = "Residual Correlation",
+         title = ttl) +
+    theme_paper
+}
+
+Fig1D_ControlLag <- plot_lag("Control", cbPalette[2], 1, "Controls: Correlation by Lag")
+Fig1E_StrokeLag  <- plot_lag("Case",    cbPalette[3], 4, "Cases: Correlation by Lag")
+
+
+
+
+
+# ------------------------------------------------------------------------------
+# Composite Layout & Annotation via Patchwork
+# ------------------------------------------------------------------------------
+Fig1A / Fig1B / (Fig1C_Trajectory + Fig1D_ControlLag + Fig1E_StrokeLag) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") & 
+  theme(
+    legend.position = "none",
+    plot.tag = element_text(size = 14, face = "bold")
+  )
+
+
+ggsave("./Figure2.jpeg",
+       plot = last_plot(),
+       width = 8,
+       height = 8,
+       dpi = 150)
+```
+
+
+
+
+---
+
+# Simulation Code if Not Loading SIM_DATA_v2 from .rds
+
+Below is the simulation code we used to generate `SIM_DATA_v2.rds`. These code were
+generated using autoregressive model like `Model 6` fit to real data. Parameters of the 
+simulation code were then changed to make the simulation more useful as a teachable example. 
+Claude Opus 5.5 was used to troubleshoot the simulation process. Simulation code are commented out below to avoid slowing down the knitting of the `R Markdown` file, and users can simply load `SIM_DATA_v2.rds` for a reproducible example. However, users who are interesting in modifying the simulation can uncomment and use the code below:
+
+```{r simulation-commentedOut}
+# library(tibble)
+# library(dplyr)
+# library(purrr)
+# library(MASS)
+# 
+# set.seed(2026) # Set once at the top of a full run
+# 
+# # ------------------------------------------------------------------------------
+# # 1. Subject-Level Structure (N = 40)
+# # ------------------------------------------------------------------------------
+# n_subj <- 40
+# 
+# subj_df <- tibble(
+#   subjID = factor(paste0("S", sprintf("%02d", 1:n_subj))),
+#   Group  = factor(rep(c("Control", "Case"), length.out = n_subj)),
+#   Age    = rnorm(n_subj, mean = 62, sd = 8),
+#   Male_c = sample(c(-0.5, 0.5), n_subj, replace = TRUE)) %>%
+#   mutate(Group = fct_relevel(Group, "Control", "Case")) # set control to 1st level
+# 
+# sd_sub_int <- sqrt(0.9718270)
+# sd_sub_trq <- 0.03
+# sd_sub_sq  <- 0.0006      # person-level quadratic slope SD
+# 
+# R_sub <- matrix(c(1.00, 0.20, 0.15,
+#                   0.20, 1.00, 0.10,
+#                   0.15, 0.10, 1.00), nrow = 3)
+# S_sub     <- diag(c(sd_sub_int, sd_sub_trq, sd_sub_sq))
+# Sigma_sub <- S_sub %*% R_sub %*% S_sub
+# 
+# sub_re  <- mvrnorm(n_subj, mu = rep(0, 3), Sigma = Sigma_sub)
+# subj_df <- subj_df %>%
+#   mutate(b0_subj    = sub_re[, 1],
+#          b_trq_subj = sub_re[, 2],
+#          b_sq_subj  = sub_re[, 3])
+# 
+# # ------------------------------------------------------------------------------
+# # 2. Subject x Muscle Level Structure 
+# # ------------------------------------------------------------------------------
+# muscles_per_subj <- c(rep(3, round(0.9 * n_subj)), rep(2, round(0.1 * n_subj)))
+# muscle_names     <- c("A", "B", "C")
+# 
+# sub_musc_df <- map2_df(subj_df$subjID, muscles_per_subj, ~ {
+#   tibble(
+#     subjID = .x,
+#     Muscle = factor(muscle_names[1:.y], levels = muscle_names)
+#   )
+# }) %>%
+#   left_join(subj_df, by = "subjID")
+# 
+# n_sub_musc <- nrow(sub_musc_df) 
+# 
+# sd_musc_int <- sqrt(1.3418647)   # intercept (unchanged)
+# sd_musc_trq <- sqrt(0.0026041)   # linear torque slope (unchanged)
+# sd_musc_sq  <- 0.0004            # quadratic torque slope (~30% of |fixed TorqueSq|)
+# 
+# # Correlations among (intercept, linear, quadratic)
+# # intercept-linear correlation
+# R_musc <- matrix(c( 1.00, 0.55, 0.20,
+#                     0.55, 1.00, 0.10,
+#                     0.20, 0.10, 1.00), nrow = 3)
+# 
+# # Convert correlations to a covariance matrix: Sigma = S %*% R %*% S
+# S_musc     <- diag(c(sd_musc_int, sd_musc_trq, sd_musc_sq))
+# Sigma_musc <- S_musc %*% R_musc %*% S_musc
+# 
+# musc_re <- mvrnorm(n_sub_musc, mu = c(0, 0, 0), Sigma = Sigma_musc)
+# sub_musc_df <- sub_musc_df %>%
+#   mutate(
+#     b0_musc    = musc_re[, 1],
+#     b_trq_musc = musc_re[, 2],
+#     b_sq_musc  = musc_re[, 3]   
+#   )
+# 
+# # ------------------------------------------------------------------------------
+# # 3. Motor Unit Level Structure
+# # ------------------------------------------------------------------------------
+# mu_counts <- rpois(n_sub_musc, lambda = 35)
+# 
+# mu_df <- map2_df(1:n_sub_musc, mu_counts, ~ {
+#   sub_musc_df[.x, ] %>%
+#     slice(rep(1, .y)) %>%
+#     mutate(UniqueMU = factor(paste0("MU_", sprintf("%04d", 1:.y))))
+# })
+# 
+# n_mu <- nrow(mu_df)
+# trials_per_mu <- pmin(1 + rpois(n_mu, lambda = 2.5), 12)
+# 
+# sd_mu_int <- sqrt(2.0)
+# mu_df <- mu_df %>% mutate(b0_mu = rnorm(n(), 0, sd_mu_int))
+# 
+# mu_df <- mu_df %>%
+#   mutate(MU_GlobalID = factor(paste(subjID, Muscle, UniqueMU, sep = ":")))
+# 
+# # ------------------------------------------------------------------------------
+# # 4. Trial-Level Observations 
+# # ------------------------------------------------------------------------------
+# n_mu <- nrow(mu_df)
+# trials_per_mu <- pmin(1 + rpois(n_mu, lambda = 2.5), 12)   # median 3, mean ~3.5, max 12
+# 
+# DATA <- map2_df(1:n_mu, trials_per_mu, ~ {
+#   mu_df[.x, ] %>%
+#     slice(rep(1, .y)) %>%
+#     mutate(RelTrial = 1:.y)
+# }) %>%
+#   arrange(subjID, Muscle, UniqueMU, RelTrial) %>%
+#   mutate(
+#     RelTrial_f = factor(RelTrial),
+#     Torque_raw = runif(n(), min = 10, max = 80)
+#   )
+# 
+# DATA <- map2_df(1:n_mu, trials_per_mu, ~ {
+#   mu_df[.x, ] %>%
+#     slice(rep(1, .y)) %>%
+#     mutate(RelTrial = 1:.y)
+# }) %>%
+#   arrange(subjID, Muscle, UniqueMU, RelTrial) %>%
+#   mutate(
+#     RelTrial_f = factor(RelTrial),
+#     Torque_raw = runif(n(), min = 10, max = 80)
+#   )
+# 
+# mean_trq <- mean(DATA$Torque_raw)
+# DATA <- DATA %>%
+#   mutate(
+#     Torque.c   = Torque_raw - mean_trq,
+#     TorqueSq.c = (Torque.c^2) - mean((Torque.c)^2)
+#   )
+# 
+# contrasts(DATA$Group)  <- contr.poly(2)
+# contrasts(DATA$Muscle) <- contr.poly(3)
+# 
+# # ------------------------------------------------------------------------------
+# # 5. Deterministic AR(1) Simulation
+# # ------------------------------------------------------------------------------
+# sigma_ar1 <- sqrt(1.8)
+# rho_ar1   <- 0.70
+# 
+# sim_ar1_series <- function(n, sigma, rho) {
+#   if (n == 1) return(rnorm(1, mean = 0, sd = sigma))
+#   e <- numeric(n)
+#   e[1] <- rnorm(1, mean = 0, sd = sigma)
+#   for (t in 2:n) {
+#     e[t] <- rho * e[t - 1] + rnorm(1, mean = 0, sd = sigma * sqrt(1 - rho^2))
+#   }
+#   return(e)
+# }
+# 
+# # Ensure explicit sorting before generating group-wise AR(1) values
+# DATA <- DATA %>% arrange(MU_GlobalID, RelTrial)
+# 
+# ar1_list <- lapply(split(DATA$RelTrial, DATA$MU_GlobalID), function(trial_seq) {
+#   sim_ar1_series(length(trial_seq), sigma_ar1, rho_ar1)
+# })
+# 
+# DATA$ar1_effect <- unlist(ar1_list, use.names = FALSE)
+# 
+# # ------------------------------------------------------------------------------
+# # 6. Fixed Effects & Response Variable
+# # ------------------------------------------------------------------------------
+# X <- model.matrix(
+#   ~ 1 + Group * Muscle * Torque.c + Group * Muscle * TorqueSq.c + 
+#     Age + Male_c + RelTrial, 
+#   data = DATA
+# )
+# 
+# beta_target <- c(
+#   "(Intercept)"                 = 13.8168050,
+#   "Group.L"                     = -2.3704227,
+#   "Muscle.L"                    = -0.4003656,
+#   "Muscle.Q"                    = -0.4402118,
+#   "Torque.c"                    = 0.0774699,
+#   "TorqueSq.c"                  = -0.0012622,
+#   "Age"                         = -0.0305329,
+#   "Male_c"                      = 0.3583333,
+#   "RelTrial"                    = -0.0018215,
+#   "Group.L:Muscle.L"            = -1.6699104,
+#   "Group.L:Muscle.Q"            = -0.5260199,
+#   "Group.L:Torque.c"            = -0.0570179,
+#   "Muscle.L:Torque.c"           = -0.0016878,
+#   "Muscle.Q:Torque.c"           = -0.0025914,
+#   "Group.L:TorqueSq.c"          = 0.0006680,
+#   "Muscle.L:TorqueSq.c"         = -0.0010320,
+#   "Muscle.Q:TorqueSq.c"         = 0.0005706,
+#   "Group.L:Muscle.L:Torque.c"   = -0.0641214,
+#   "Group.L:Muscle.Q:Torque.c"   = 0.0031796,
+#   "Group.L:Muscle.L:TorqueSq.c" = 0.0017488,
+#   "Group.L:Muscle.Q:TorqueSq.c" = -0.0000401
+# )
+# 
+# # Align beta coefficients by name to match model matrix column order
+# eta_fixed <- X %*% beta_target[colnames(X)]
+# 
+# sigma_res <- sqrt(0.7710400)
+# epsilon   <- rnorm(nrow(DATA), mean = 0, sd = sigma_res)
+# 
+# DATA <- DATA %>%
+#   mutate(FR = as.numeric(eta_fixed) +
+#            b0_subj + b_trq_subj * Torque.c +
+#            b0_musc + b_trq_musc * Torque.c + b_sq_musc * TorqueSq.c +
+#            b0_mu +
+#            ar1_effect +
+#            epsilon)
+# 
+# DATA_SIM <- DATA %>%
+#   dplyr::select(subjID, Group, Muscle, UniqueMU, MU_GlobalID, RelTrial, RelTrial_f, 
+#                 Torque.c, TorqueSq.c, Age, Male_c, FR)
+# 
+# saveRDS(DATA_SIM, file = "SIM_DATA_v2.rds")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+
+```
+
+```
+
+```
